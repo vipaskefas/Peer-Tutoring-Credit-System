@@ -5,6 +5,11 @@
 (define-constant ERR-INSUFFICIENT-CREDITS (err u104))
 (define-constant ERR-INVALID-RATING (err u105))
 (define-constant ERR-SESSION-EXISTS (err u106))
+(define-constant ERR-DISPUTE-EXISTS (err u107))
+(define-constant ERR-DISPUTE-NOT-FOUND (err u108))
+(define-constant ERR-DISPUTE-CLOSED (err u109))
+(define-constant ERR-ALREADY-VOTED (err u110))
+(define-constant ERR-VOTE-PERIOD-ENDED (err u111))
 
 (define-fungible-token tutoring-credit)
 
@@ -30,6 +35,22 @@
      timestamp: uint})
 
 (define-data-var session-counter uint u0)
+(define-data-var dispute-counter uint u0)
+(define-data-var dispute-voting-period uint u1440)
+
+(define-map session-disputes
+    uint
+    {session-id: uint,
+     disputer: principal,
+     reason: (string-ascii 100),
+     status: (string-ascii 20),
+     votes-for: uint,
+     votes-against: uint,
+     expiry-block: uint})
+
+(define-map dispute-votes
+    {dispute-id: uint, voter: principal}
+    bool)
 
 (define-public (register-as-tutor)
     (let ((caller tx-sender))
@@ -106,3 +127,73 @@
 
 (define-public (transfer-credits (recipient principal) (amount uint))
     (ft-transfer? tutoring-credit amount tx-sender recipient))
+
+(define-public (create-dispute (session-id uint) (reason (string-ascii 100)))
+    (let ((session (unwrap! (map-get? tutoring-sessions session-id) ERR-INVALID-SESSION))
+          (dispute-id (+ (var-get dispute-counter) u1))
+          (caller tx-sender))
+        (asserts! (is-eq (get status session) "completed") ERR-INVALID-SESSION)
+        (asserts! (or (is-eq (get tutor session) caller) (is-eq (get student session) caller)) ERR-NOT-AUTHORIZED)
+        (asserts! (is-none (get match (get-dispute-by-session session-id))) ERR-DISPUTE-EXISTS)
+        (var-set dispute-counter dispute-id)
+        (map-set session-disputes dispute-id {
+            session-id: session-id,
+            disputer: caller,
+            reason: reason,
+            status: "open",
+            votes-for: u0,
+            votes-against: u0,
+            expiry-block: (+ stacks-block-height (var-get dispute-voting-period))
+        })
+        (ok dispute-id)))
+
+(define-public (vote-on-dispute (dispute-id uint) (vote-for bool))
+    (let ((dispute (unwrap! (map-get? session-disputes dispute-id) ERR-DISPUTE-NOT-FOUND))
+          (caller tx-sender)
+          (vote-key {dispute-id: dispute-id, voter: caller}))
+        (asserts! (is-eq (get status dispute) "open") ERR-DISPUTE-CLOSED)
+        (asserts! (< stacks-block-height (get expiry-block dispute)) ERR-VOTE-PERIOD-ENDED)
+        (asserts! (is-none (map-get? dispute-votes vote-key)) ERR-ALREADY-VOTED)
+        (asserts! (is-some (get-tutor-info caller)) ERR-INVALID-TUTOR)
+        (map-set dispute-votes vote-key vote-for)
+        (if vote-for
+            (map-set session-disputes dispute-id (merge dispute 
+                {votes-for: (+ (get votes-for dispute) u1)}))
+            (map-set session-disputes dispute-id (merge dispute 
+                {votes-against: (+ (get votes-against dispute) u1)})))
+        (ok true)))
+
+(define-public (resolve-dispute (dispute-id uint))
+    (let ((dispute (unwrap! (map-get? session-disputes dispute-id) ERR-DISPUTE-NOT-FOUND)))
+        (asserts! (is-eq (get status dispute) "open") ERR-DISPUTE-CLOSED)
+        (asserts! (>= stacks-block-height (get expiry-block dispute)) ERR-VOTE-PERIOD-ENDED)
+        (if (> (get votes-for dispute) (get votes-against dispute))
+            (begin
+                (map-set session-disputes dispute-id (merge dispute {status: "resolved-favor"}))
+                (try! (reverse-session-credits (get session-id dispute))))
+            (map-set session-disputes dispute-id (merge dispute {status: "resolved-against"})))
+        (ok true)))
+
+(define-private (reverse-session-credits (session-id uint))
+    (let ((session (unwrap! (map-get? tutoring-sessions session-id) ERR-INVALID-SESSION)))
+        (let ((credits-to-burn (* (/ (get duration session) u60) (var-get credit-per-hour))))
+            (ft-burn? tutoring-credit credits-to-burn (get tutor session)))))
+
+(define-private (get-dispute-by-session (target-session-id uint))
+    (fold check-dispute-match (list u1 u2 u3 u4 u5 u6 u7 u8 u9 u10) 
+        {target: target-session-id, match: none}))
+
+(define-private (check-dispute-match (dispute-id uint) (state {target: uint, match: (optional uint)}))
+    (if (is-some (get match state))
+        state
+        (match (map-get? session-disputes dispute-id)
+            dispute (if (is-eq (get session-id dispute) (get target state)) 
+                       {target: (get target state), match: (some dispute-id)} 
+                       state)
+            state)))
+
+(define-read-only (get-dispute-info (dispute-id uint))
+    (map-get? session-disputes dispute-id))
+
+(define-read-only (get-user-vote (dispute-id uint) (voter principal))
+    (map-get? dispute-votes {dispute-id: dispute-id, voter: voter}))
