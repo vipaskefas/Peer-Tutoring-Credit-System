@@ -12,6 +12,7 @@
 (define-constant ERR-VOTE-PERIOD-ENDED (err u111))
 (define-constant ERR-ACHIEVEMENT-NOT-FOUND (err u112))
 (define-constant ERR-ACHIEVEMENT-ALREADY-EARNED (err u113))
+(define-constant ERR-BADGE-NOT-FOUND (err u114))
 
 (define-fungible-token tutoring-credit)
 
@@ -51,6 +52,41 @@
         reward-credits: u100,
         requirement-type: "sessions",
         requirement-value: u50
+    })
+    (var-set badge-counter u1)
+    (map-set reputation-badges u1 {
+        name: "Novice",
+        min-sessions: u0,
+        min-rating: u0,
+        credit-multiplier: u100
+    })
+    (var-set badge-counter u2)
+    (map-set reputation-badges u2 {
+        name: "Bronze",
+        min-sessions: u5,
+        min-rating: u350,
+        credit-multiplier: u110
+    })
+    (var-set badge-counter u3)
+    (map-set reputation-badges u3 {
+        name: "Silver",
+        min-sessions: u15,
+        min-rating: u400,
+        credit-multiplier: u125
+    })
+    (var-set badge-counter u4)
+    (map-set reputation-badges u4 {
+        name: "Gold",
+        min-sessions: u30,
+        min-rating: u450,
+        credit-multiplier: u150
+    })
+    (var-set badge-counter u5)
+    (map-set reputation-badges u5 {
+        name: "Platinum",
+        min-sessions: u60,
+        min-rating: u475,
+        credit-multiplier: u200
     }))
 
 (define-map tutors 
@@ -87,6 +123,19 @@
     {earned-at: uint, claimed: bool})
 
 (define-data-var achievement-counter uint u0)
+
+(define-map reputation-badges
+    uint
+    {name: (string-ascii 30),
+     min-sessions: uint,
+     min-rating: uint,
+     credit-multiplier: uint})
+
+(define-map tutor-badges
+    principal
+    uint)
+
+(define-data-var badge-counter uint u0)
 
 (define-map session-disputes
     uint
@@ -156,8 +205,10 @@
         (ok true)))
 
 (define-private (mint-session-credits (tutor principal) (duration uint))
-    (let ((credits-to-mint (* (/ duration u60) (var-get credit-per-hour))))
-        (ft-mint? tutoring-credit credits-to-mint tutor)))
+    (let ((base-credits (* (/ duration u60) (var-get credit-per-hour))))
+        (let ((multiplier (get-tutor-credit-multiplier tutor)))
+            (let ((credits-to-mint (/ (* base-credits multiplier) u100)))
+                (ft-mint? tutoring-credit credits-to-mint tutor)))))
 
 (define-private (update-tutor-rating (tutor principal) (new-rating uint))
     (let ((tutor-data (unwrap! (get-tutor-info tutor) ERR-INVALID-TUTOR))
@@ -166,6 +217,7 @@
         (map-set tutors tutor (merge tutor-data 
             {rating: new-avg-rating,
              total-sessions: new-session-count}))
+        (unwrap! (update-tutor-badge tutor new-session-count new-avg-rating) ERR-NOT-AUTHORIZED)
         (try! (check-and-award-achievements tutor new-session-count new-avg-rating))
         (ok true)))
 
@@ -302,3 +354,40 @@
 
 (define-read-only (has-achievement (user principal) (achievement-id uint))
     (is-some (map-get? user-achievements {user: user, achievement-id: achievement-id})))
+
+(define-private (update-tutor-badge (tutor principal) (session-count uint) (rating uint))
+    (let ((current-badge-id (default-to u1 (map-get? tutor-badges tutor))))
+        (let ((new-badge-id (calculate-badge-tier session-count rating)))
+            (begin
+                (if (> new-badge-id current-badge-id)
+                    (map-set tutor-badges tutor new-badge-id)
+                    true)
+                (ok true)))))
+
+(define-private (calculate-badge-tier (session-count uint) (rating uint))
+    (if (and (>= session-count u60) (>= rating u475))
+        u5
+        (if (and (>= session-count u30) (>= rating u450))
+            u4
+            (if (and (>= session-count u15) (>= rating u400))
+                u3
+                (if (and (>= session-count u5) (>= rating u350))
+                    u2
+                    u1)))))
+
+(define-private (get-tutor-credit-multiplier (tutor principal))
+    (let ((badge-id (default-to u1 (map-get? tutor-badges tutor))))
+        (let ((badge-data (map-get? reputation-badges badge-id)))
+            (if (is-some badge-data)
+                (get credit-multiplier (unwrap-panic badge-data))
+                u100))))
+
+(define-read-only (get-tutor-badge (tutor principal))
+    (let ((badge-id (default-to u1 (map-get? tutor-badges tutor))))
+        (map-get? reputation-badges badge-id)))
+
+(define-read-only (get-badge-info (badge-id uint))
+    (map-get? reputation-badges badge-id))
+
+(define-read-only (get-tutor-multiplier (tutor principal))
+    (ok (get-tutor-credit-multiplier tutor)))
